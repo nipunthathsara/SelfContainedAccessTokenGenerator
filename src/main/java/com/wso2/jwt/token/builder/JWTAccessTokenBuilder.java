@@ -23,10 +23,13 @@ import com.nimbusds.jose.JOSEException;
 import com.nimbusds.jose.JWSAlgorithm;
 import com.nimbusds.jose.JWSHeader;
 import com.nimbusds.jose.JWSSigner;
+import com.nimbusds.jose.crypto.MACSigner;
 import com.nimbusds.jose.crypto.RSASSASigner;
 import com.nimbusds.jwt.JWTClaimsSet;
 import com.nimbusds.jwt.PlainJWT;
 import com.nimbusds.jwt.SignedJWT;
+import org.apache.axiom.om.OMElement;
+import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang.StringUtils;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -36,20 +39,22 @@ import org.wso2.carbon.core.util.KeyStoreManager;
 import org.wso2.carbon.identity.application.authentication.framework.model.AuthenticatedUser;
 import org.wso2.carbon.identity.application.common.model.Claim;
 import org.wso2.carbon.identity.application.common.model.ClaimMapping;
+import org.wso2.carbon.identity.core.util.IdentityConfigParser;
+import org.wso2.carbon.identity.core.util.IdentityCoreConstants;
 import org.wso2.carbon.identity.core.util.IdentityTenantUtil;
+import org.wso2.carbon.identity.core.util.IdentityUtil;
 import org.wso2.carbon.identity.oauth.config.OAuthServerConfiguration;
+import org.wso2.carbon.identity.oauth.dao.OAuthAppDO;
 import org.wso2.carbon.identity.oauth2.IdentityOAuth2Exception;
 import org.wso2.carbon.identity.oauth2.authz.OAuthAuthzReqMessageContext;
 import org.wso2.carbon.identity.oauth2.token.OAuthTokenReqMessageContext;
 import org.wso2.carbon.identity.oauth2.token.OauthTokenIssuerImpl;
 import org.wso2.carbon.identity.oauth2.util.OAuth2Util;
 
+import javax.xml.namespace.QName;
 import java.security.Key;
 import java.security.interfaces.RSAPrivateKey;
-import java.util.Arrays;
-import java.util.Calendar;
-import java.util.Date;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class JWTAccessTokenBuilder extends OauthTokenIssuerImpl {
@@ -69,6 +74,11 @@ public class JWTAccessTokenBuilder extends OauthTokenIssuerImpl {
     private static final String SHA512_WITH_EC = "SHA512withEC";
 
     private static final Log log = LogFactory.getLog(JWTAccessTokenBuilder.class);
+    private static final String CONFIG_ELEM_OAUTH = "OAuth";
+    private static final String OPENID_CONNECT_AUDIENCES = "Audiences";
+    private static final String OPENID_CONNECT_AUDIENCE = "Audience";
+    private static final String OPENID_CONNECT = "OpenIDConnect";
+
     /**
      * Map for private keys
      */
@@ -82,7 +92,7 @@ public class JWTAccessTokenBuilder extends OauthTokenIssuerImpl {
         }
         config = OAuthServerConfiguration.getInstance();
         //map signature algorithm from identity.xml to nimbus format, this is a one time configuration
-        signatureAlgorithm = mapSignatureAlgorithm(config.getSignatureAlgorithm());
+        signatureAlgorithm = mapSignatureAlgorithm(config.getIdTokenSignatureAlgorithm());
     }
 
     public String accessToken(OAuthTokenReqMessageContext oAuthTokenReqMessageContext) throws OAuthSystemException {
@@ -137,11 +147,19 @@ public class JWTAccessTokenBuilder extends OauthTokenIssuerImpl {
         if (!StringUtils.isNotBlank(subject)) {
             subject = request.getAuthorizedUser().getUserName();
         }
+
+        ArrayList<String> audience = new ArrayList<String>();
+        audience.add(request.getOauth2AccessTokenReqDTO().getClientId());
+        if (CollectionUtils.isNotEmpty(getOIDCEndpointUrl())) {
+            audience.addAll(getOIDCEndpointUrl());
+        }
+
         // Set claims to jwt token.
         JWTClaimsSet jwtClaimsSet = new JWTClaimsSet();
         jwtClaimsSet.setIssuer(issuer);
         jwtClaimsSet.setSubject(subject);
-        jwtClaimsSet.setAudience(Arrays.asList(request.getOauth2AccessTokenReqDTO().getClientId()));
+//        jwtClaimsSet.setAudience(Arrays.asList(request.getOauth2AccessTokenReqDTO().getClientId()));
+        jwtClaimsSet.setAudience(audience);
         jwtClaimsSet.setClaim(Constants.AUTHORIZATION_PARTY, request.getOauth2AccessTokenReqDTO().getClientId());
         jwtClaimsSet.setExpirationTime(new Date(curTimeInMillis + lifetimeInMillis));
         jwtClaimsSet.setIssueTime(new Date(curTimeInMillis));
@@ -174,10 +192,18 @@ public class JWTAccessTokenBuilder extends OauthTokenIssuerImpl {
             subject = request.getAuthorizationReqDTO().getUser().getUserName();
         }
 
+
+        ArrayList<String> audience = new ArrayList<String>();
+        audience.add(request.getAuthorizationReqDTO().getConsumerKey());
+        if (CollectionUtils.isNotEmpty(getOIDCEndpointUrl())) {
+            audience.addAll(getOIDCEndpointUrl());
+        }
+
         JWTClaimsSet jwtClaimsSet = new JWTClaimsSet();
         jwtClaimsSet.setIssuer(issuer);
         jwtClaimsSet.setSubject(subject);
-        jwtClaimsSet.setAudience(Arrays.asList(request.getAuthorizationReqDTO().getConsumerKey()));
+        jwtClaimsSet.setAudience(audience);
+//        jwtClaimsSet.setAudience(Arrays.asList(request.getAuthorizationReqDTO().getConsumerKey()));
         jwtClaimsSet.setClaim(Constants.AUTHORIZATION_PARTY, request.getAuthorizationReqDTO().getConsumerKey());
         jwtClaimsSet.setExpirationTime(new Date(curTimeInMillis + lifetimeInMillis));
         jwtClaimsSet.setIssueTime(new Date(curTimeInMillis));
@@ -300,8 +326,7 @@ public class JWTAccessTokenBuilder extends OauthTokenIssuerImpl {
             return signJWTWithRSA(jwtClaimsSet, request);
         } else if (JWSAlgorithm.HS256.equals(signatureAlgorithm) || JWSAlgorithm.HS384.equals(signatureAlgorithm) ||
                 JWSAlgorithm.HS512.equals(signatureAlgorithm)) {
-            // return signWithHMAC(jwtClaimsSet,jwsAlgorithm,request); implementation need to be done
-            return null;
+             return signWithHMAC(jwtClaimsSet,request); //implementation need to be done
         } else {
             // return signWithEC(jwtClaimsSet,jwsAlgorithm,request); implementation need to be done
             return null;
@@ -370,4 +395,72 @@ public class JWTAccessTokenBuilder extends OauthTokenIssuerImpl {
         }
     }
 
+    private List<String> getOIDCEndpointUrl() {
+        List<String> OIDCEntityId = getOIDCAudiences();
+        return OIDCEntityId;
+    }
+
+    private List<String> getOIDCAudiences() {
+        List<String> audiences = new ArrayList<String>();
+        IdentityConfigParser configParser = IdentityConfigParser.getInstance();
+        OMElement oauthElem = configParser.getConfigElement(CONFIG_ELEM_OAUTH);
+
+        if (oauthElem == null) {
+            warnOnFaultyConfiguration("OAuth element is not available.");
+            return Collections.EMPTY_LIST;
+        }
+        OMElement configOpenIDConnect = oauthElem.getFirstChildWithName(getQNameWithIdentityNS(OPENID_CONNECT));
+
+        if (configOpenIDConnect == null) {
+            warnOnFaultyConfiguration("OpenID element is not available.");
+            return Collections.EMPTY_LIST;
+        }
+        OMElement configAudience = configOpenIDConnect.
+                getFirstChildWithName(getQNameWithIdentityNS(OPENID_CONNECT_AUDIENCES));
+
+        if (configAudience == null) {
+            return Collections.EMPTY_LIST;
+        }
+
+        Iterator<OMElement> iterator =
+                configAudience.getChildrenWithName(getQNameWithIdentityNS(OPENID_CONNECT_AUDIENCE));
+        while (iterator.hasNext()) {
+            OMElement supportedAudience = iterator.next();
+            String supportedAudienceName = null;
+
+            if (supportedAudience != null) {
+                supportedAudienceName = IdentityUtil.fillURLPlaceholders(supportedAudience.getText());
+            }
+            if (StringUtils.isNotBlank(supportedAudienceName)) {
+                audiences.add(supportedAudienceName);
+            }
+        }
+        return audiences;
+    }
+
+    private void warnOnFaultyConfiguration(String logMsg) {
+        log.warn("Error in OAuth Configuration. " + logMsg);
+    }
+
+    private QName getQNameWithIdentityNS(String localPart) {
+        return new QName(IdentityCoreConstants.IDENTITY_DEFAULT_NAMESPACE, localPart);
+    }
+
+    protected String signWithHMAC(JWTClaimsSet jwtClaimsSet, OAuthTokenReqMessageContext request)
+            throws IdentityOAuth2Exception {
+        String consumerSecret = null;
+        if (request.getProperty("OAuthAppDO") != null && request.getProperty("OAuthAppDO") instanceof OAuthAppDO) {
+            consumerSecret = ((OAuthAppDO) request.getProperty("OAuthAppDO")).getOauthConsumerSecret();
+            try {
+                JWSSigner signer = new MACSigner(consumerSecret);
+                SignedJWT signedJWT = new SignedJWT(new JWSHeader((JWSAlgorithm) signatureAlgorithm), jwtClaimsSet);
+                signedJWT.sign(signer);
+                return signedJWT.serialize();
+            } catch (JOSEException e) {
+                throw new IdentityOAuth2Exception("Error occurred while signing JWT", e);
+            }
+        } else {
+            throw new IdentityOAuth2Exception("Error while obtaining consumer secret");
+        }
+    }
 }
